@@ -1,258 +1,188 @@
 import streamlit as st
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-import bcrypt
-import os
+import bcrypt, os
 
-# ----------------------------------------------------
-# MongoDB Connection Setup
-# ----------------------------------------------------
+# -------------------------------------------------------------------
+# LOCAL FALLBACK DB (if MongoDB not available)
+# -------------------------------------------------------------------
+class LocalDB:
+    def __init__(self):
+        self.users = [{"username": "admin", "password": bcrypt.hashpw("admin".encode(), bcrypt.gensalt()), "role": "admin"}]
+        self.products = [
+            {"_id": 1, "name": "Shirt", "price": 299},
+            {"_id": 2, "name": "Shoes", "price": 999},
+        ]
+        self.orders = []
+
+localdb = LocalDB()
+
 @st.cache_resource
 def get_db():
-    # Prefer secrets.toml, fallback to environment variables
-    mongodb_uri = None
-    admin_user = None
-    admin_password = None
+    uri = st.secrets.get("mongodb", {}).get("uri", None) or os.getenv("MONGODB_URI")
 
-    if "mongodb" in st.secrets:
-        mongodb_uri = st.secrets["mongodb"].get("uri")
-    else:
-        mongodb_uri = os.environ.get("MONGODB_URI")
+    if not uri:
+        st.warning("⚠️ No MongoDB found — using Local In-Memory Database")
+        return {"mode": "local", "users": localdb.users, "products": localdb.products, "orders": localdb.orders}
 
-    if "admin" in st.secrets:
-        admin_user = st.secrets["admin"].get("username")
-        admin_password = st.secrets["admin"].get("password")
-    else:
-        admin_user = os.environ.get("ADMIN_USERNAME")
-        admin_password = os.environ.get("ADMIN_PASSWORD")
+    client = MongoClient(uri)
+    db = client.get_database("store_app")
+    return {"mode": "mongo", "users": db.users, "products": db.products, "orders": db.orders}
 
-    if not mongodb_uri:
-        st.error("❌ MongoDB URI not found. Please set it in Streamlit secrets or environment variable.")
-        st.stop()
+db = get_db()
+mode = db["mode"]
+users_col = db["users"]
+products_col = db["products"]
+orders_col = db["orders"]
 
-    client = MongoClient(mongodb_uri)
-    db = client.get_database("streamlit_store")
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
+def hashpw(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt())
+def checkpw(p, h): return bcrypt.checkpw(p.encode(), h)
 
-    users = db.users
-    products = db.products
-    orders = db.orders
+def get_user(username):
+    if mode == "mongo": return users_col.find_one({"username": username})
+    return next((u for u in users_col if u["username"] == username), None)
 
-    # Create admin user if not exists
-    if admin_user and admin_password:
-        if users.find_one({"username": admin_user, "role": "admin"}) is None:
-            hashed_pw = bcrypt.hashpw(admin_password.encode(), bcrypt.gensalt())
-            users.insert_one({
-                "username": admin_user,
-                "password": hashed_pw,
-                "role": "admin"
-            })
-
-    return {"db": db, "users": users, "products": products, "orders": orders}
-
-
-# ----------------------------------------------------
-# Initialize database and collections
-# ----------------------------------------------------
-dbs = get_db()
-users_col = dbs["users"]
-products_col = dbs["products"]
-orders_col = dbs["orders"]
-
-# ----------------------------------------------------
-# Helper Functions
-# ----------------------------------------------------
-def hash_password(password: str) -> bytes:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-
-def check_password(password: str, hashed: bytes) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode(), hashed)
-    except Exception:
-        return False
-
-def create_user(username: str, password: str, role: str = "user"):
-    if users_col.find_one({"username": username}):
-        return False, "User already exists!"
-    hashed = hash_password(password)
-    users_col.insert_one({"username": username, "password": hashed, "role": role})
-    return True, "✅ User created successfully!"
-
-def create_product(name: str, price: float):
-    products_col.insert_one({"name": name, "price": float(price)})
-    return True
+def create_user(username, password):
+    if get_user(username): return False, "User exists!"
+    u = {"username": username, "password": hashpw(password), "role": "user"}
+    users_col.insert_one(u) if mode == "mongo" else users_col.append(u)
+    return True, "User created ✔"
 
 def list_products():
-    return list(products_col.find())
+    return list(products_col.find()) if mode == "mongo" else products_col
 
-def authenticate(username: str, password: str):
-    user = users_col.find_one({"username": username})
-    if not user:
-        return None
-    if check_password(password, user["password"]):
-        return {"_id": str(user["_id"]), "username": user["username"], "role": user.get("role", "user")}
+def create_product(name, price):
+    doc = {"name": name, "price": float(price)}
+    products_col.insert_one(doc) if mode == "mongo" else products_col.append({"_id": len(products_col)+1, **doc})
+
+def authenticate(username, password):
+    u = get_user(username)
+    if not u: return None
+    if checkpw(password, u["password"]):
+        u["_id"] = str(u.get("_id", username))
+        return u
     return None
 
-def place_order(user_id, username, cart_items):
-    total = sum(item["price"] * item.get("qty", 1) for item in cart_items)
-    order = {
-        "user_id": ObjectId(user_id),
-        "username": username,
-        "items": cart_items,
-        "total": total,
-        "status": "placed"
-    }
-    orders_col.insert_one(order)
+def place_order(uid, uname, items):
+    total = sum(i["qty"] * i["price"] for i in items)
+    order = {"user_id": uid, "username": uname, "items": items, "total": total}
+    (orders_col.insert_one(order) if mode == "mongo" else orders_col.append(order))
     return order
 
-# ----------------------------------------------------
-# Streamlit App UI
-# ----------------------------------------------------
+# -------------------------------------------------------------------
+# UI STATE
+# -------------------------------------------------------------------
 st.set_page_config(page_title="Mini Store", layout="wide")
-
-if "page" not in st.session_state:
-    st.session_state.page = "login"
-if "user" not in st.session_state:
-    st.session_state.user = None
-if "cart" not in st.session_state:
-    st.session_state.cart = []
+if "page" not in st.session_state: st.session_state.page = "login"
+if "user" not in st.session_state: st.session_state.user = None
+if "cart" not in st.session_state: st.session_state.cart = []
 
 def logout():
+    st.session_state.page = "login"
     st.session_state.user = None
     st.session_state.cart = []
-    st.session_state.page = "login"
 
-# ----------------------------------------------------
-# Header / Top Bar
-# ----------------------------------------------------
-col1, col2, col3 = st.columns([1, 4, 2])
-with col1:
-    st.title("🛍️ Mini Store")
+# -------------------------------------------------------------------
+# HEADER
+# -------------------------------------------------------------------
+col1, col2, col3 = st.columns([1,4,2])
+with col1: st.title("🛍️ Mini Store")
 with col3:
     if st.session_state.user:
-        st.markdown(f"**Logged in as:** {st.session_state.user['username']}")
-        if st.button("Logout"):
-            logout()
+        st.write(f"Logged in as **{st.session_state.user['username']}**")
+        if st.button("Logout"): logout()
 
-# ----------------------------------------------------
+# -------------------------------------------------------------------
 # LOGIN PAGE
-# ----------------------------------------------------
+# -------------------------------------------------------------------
 if st.session_state.page == "login":
     st.header("🔐 Login")
-    tab1, tab2 = st.tabs(["Admin Login", "User Login"])
+    tab1, tab2 = st.tabs(["Admin", "User"])
 
+    # Admin
     with tab1:
-        st.subheader("Admin Login")
-        admin_username = st.text_input("Admin Username")
-        admin_password = st.text_input("Admin Password", type="password")
+        a = st.text_input("Admin Username")
+        b = st.text_input("Admin Password", type="password")
         if st.button("Login as Admin"):
-            user = authenticate(admin_username, admin_password)
-            if user and user["role"] == "admin":
-                st.session_state.user = user
+            u = authenticate(a, b)
+            if u and u.get("role") == "admin":
+                st.session_state.user = u
                 st.session_state.page = "admin"
-                st.success("✅ Admin login successful!")
+                st.success("Admin Login ✔")
             else:
-                st.error("Invalid admin credentials.")
+                st.error("Invalid Admin")
 
+    # User
     with tab2:
-        st.subheader("User Login")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
         if st.button("Login as User"):
-            user = authenticate(username, password)
-            if user and user["role"] == "user":
+            user = authenticate(u, p)
+            if user:
                 st.session_state.user = user
                 st.session_state.page = "store"
-                st.success("✅ Login successful!")
+                st.success("Login ✔")
             else:
-                st.error("Invalid user credentials.")
+                st.error("Invalid User Login")
 
-# ----------------------------------------------------
+# -------------------------------------------------------------------
 # ADMIN PAGE
-# ----------------------------------------------------
+# -------------------------------------------------------------------
 elif st.session_state.page == "admin":
     st.header("👨‍💼 Admin Dashboard")
 
-    # Create new user
-    st.subheader("Create a new user")
-    with st.form("create_user_form"):
-        new_user = st.text_input("Username")
-        new_pass = st.text_input("Password", type="password")
-        submitted_user = st.form_submit_button("Create User")
-        if submitted_user:
-            ok, msg = create_user(new_user, new_pass)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+    st.subheader("Create User")
+    with st.form("f1"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.form_submit_button("Create"):
+            ok, msg = create_user(u, p)
+            st.success(msg) if ok else st.error(msg)
 
-    # Create product
     st.subheader("Add Product")
-    with st.form("create_product_form"):
-        pname = st.text_input("Product Name")
-        pprice = st.number_input("Price (₹)", min_value=0.0, format="%.2f")
-        submitted_p = st.form_submit_button("Add Product")
-        if submitted_p:
-            if pname:
-                create_product(pname, pprice)
-                st.success(f"✅ Product '{pname}' added successfully!")
-            else:
-                st.error("Please enter a product name.")
+    with st.form("f2"):
+        n = st.text_input("Product Name")
+        pr = st.number_input("Price", min_value=1.0)
+        if st.form_submit_button("Add"):
+            create_product(n, pr)
+            st.success("Product Added ✔")
 
-    # List products
-    st.subheader("🧾 Product List")
-    prods = list_products()
-    if prods:
-        for p in prods:
-            st.write(f"- **{p['name']}** — ₹{p['price']}")
-    else:
-        st.info("No products added yet.")
+    st.subheader("Products")
+    for p in list_products(): st.write(f"- {p['name']} — ₹{p['price']}")
 
-    if st.button("🔙 Back to Login"):
-        logout()
+    st.button("Back", on_click=logout)
 
-# ----------------------------------------------------
-# STORE PAGE (User View)
-# ----------------------------------------------------
+# -------------------------------------------------------------------
+# STORE PAGE
+# -------------------------------------------------------------------
 elif st.session_state.page == "store":
-    st.header("🛒 Products Available")
+    st.header("🛒 Products")
     prods = list_products()
 
-    if prods:
-        cols = st.columns(3)
-        for i, p in enumerate(prods):
-            col = cols[i % 3]
-            with col:
-                st.subheader(p["name"])
-                st.write(f"Price: ₹{p['price']}")
-                qty = st.number_input(f"Quantity for {p['name']}", min_value=1, value=1, key=f"qty_{i}")
-                if st.button(f"Add {p['name']} to Cart", key=f"add_{i}"):
-                    st.session_state.cart.append({
-                        "product_id": str(p["_id"]),
-                        "name": p["name"],
-                        "price": float(p["price"]),
-                        "qty": int(qty),
-                    })
-                    st.success(f"Added {p['name']} to cart!")
-    else:
-        st.warning("No products available yet!")
+    cols = st.columns(3)
+    for i, p in enumerate(prods):
+        with cols[i % 3]:
+            st.subheader(p["name"])
+            st.write(f"₹{p['price']}")
+            q = st.number_input(f"Qty {p['name']}", 1, key=f"qty{i}")
+            if st.button(f"Add {p['name']}", key=f"b{i}"):
+                st.session_state.cart.append({"name": p["name"], "price": p["price"], "qty": q})
+                st.success("Added ✔")
 
-    # Cart sidebar
-    st.sidebar.header("🧺 Your Cart")
+    st.sidebar.header("🧺 Cart")
     if st.session_state.cart:
-        total = 0
-        for item in st.session_state.cart:
-            subtotal = item["price"] * item["qty"]
-            total += subtotal
-            st.sidebar.write(f"{item['name']} × {item['qty']} — ₹{subtotal:.2f}")
-        st.sidebar.write(f"**Total: ₹{total:.2f}**")
-        if st.sidebar.button("✅ Place Order"):
-            user = st.session_state.user
-            order = place_order(user["_id"], user["username"], st.session_state.cart)
+        total = sum(i["price"] * i["qty"] for i in st.session_state.cart)
+        for i in st.session_state.cart:
+            st.sidebar.write(f"{i['name']} × {i['qty']} = ₹{i['price']*i['qty']}")
+        st.sidebar.write(f"**Total = ₹{total}**")
+        if st.sidebar.button("Place Order"):
+            o = place_order(st.session_state.user["_id"], st.session_state.user["username"], st.session_state.cart)
             st.session_state.cart = []
-            st.success(f"🎉 Order placed successfully! Total ₹{order['total']:.2f}")
-            st.balloons()
+            st.success(f"Order Placed — ₹{o['total']}")
     else:
-        st.sidebar.write("Your cart is empty.")
+        st.sidebar.write("Empty Cart")
 
-    if st.button("🔙 Back to Login"):
-        logout()
+    st.button("Back", on_click=logout)
